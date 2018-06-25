@@ -1,8 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,9 +18,9 @@ import (
 	"github.com/go-kit/kit/endpoint"
 	"github.com/go-kit/kit/sd"
 	"github.com/go-kit/kit/sd/lb"
-	httptransport "github.com/go-kit/kit/transport/http"
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/snappy"
+	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
@@ -30,7 +30,7 @@ import (
 
 var (
 	listenAddress = flag.String("web.listen-address", ":9268", "Address to listen on for Prometheus requests.")
-	crateURL      = flag.String("crate.url", "http://localhost:4200/_sql", "URL to send Crate SQL to. Can list multiple URLs comma seperated.")
+	crateURL      = flag.String("crate.url", "postgres://crate@localhost:5432/?sslmode=disable", "URL to send Crate SQL to. Can list multiple URLs comma seperated.")
 
 	writeDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "crate_adapter_write_latency_seconds",
@@ -100,16 +100,6 @@ func escapeLabelValue(s string) string {
 	return "'" + escaper.Replace(s) + "'"
 }
 
-type crateRequest struct {
-	Stmt     string          `json:"stmt"`
-	BulkArgs [][]interface{} `json:"bulk_args,omitempty"`
-}
-
-type crateResponse struct {
-	Cols []string        `json:"cols,omitempty"`
-	Rows [][]interface{} `json:"rows,omitempty"`
-}
-
 // Convert a read query into a Crate SQL query.
 func queryToSQL(q *remote.Query) (string, error) {
 	selectors := make([]string, 0, len(q.Matchers)+2)
@@ -160,27 +150,23 @@ func queryToSQL(q *remote.Query) (string, error) {
 	return fmt.Sprintf("SELECT * from metrics WHERE %s ORDER BY timestamp", strings.Join(selectors, " AND ")), nil
 }
 
-func responseToTimeseries(data *crateResponse) []*remote.TimeSeries {
+func responseToTimeseries(data *crateReadResponse) ([]*remote.TimeSeries, error) {
 	timeseries := map[string]*remote.TimeSeries{}
 	for _, row := range data.Rows {
-		metric := model.Metric{}
-		var v float64
-		var t int64
-		for i, value := range row {
-			switch data.Cols[i] {
-			case "labels":
-				labels := value.(map[string]interface{})
-				for k, v := range labels {
-					// lfoo -> foo.
-					metric[model.LabelName(k)] = model.LabelValue(v.(string))
-				}
-			case "timestamp":
-				t, _ = value.(json.Number).Int64()
-			case "valueRaw":
-				val, _ := value.(json.Number).Int64()
-				v = math.Float64frombits(uint64(val))
-			}
+		labels := map[string]string{}
+		err := json.Unmarshal(row.labels, &labels)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal labels %q: %v", row.labels, err)
 		}
+		metric := model.Metric{}
+		for k, v := range labels {
+			// lfoo -> foo.
+			metric[model.LabelName(k)] = model.LabelValue(v)
+		}
+
+		t := row.timestamp.UnixNano() / 1e6
+		v := math.Float64frombits(uint64(row.valueRaw))
+
 		ts, ok := timeseries[metric.String()]
 		if !ok {
 			ts = &remote.TimeSeries{}
@@ -207,7 +193,7 @@ func responseToTimeseries(data *crateResponse) []*remote.TimeSeries {
 		writeSamples.Observe(float64(len(timeseries[name].Samples)))
 		resp = append(resp, timeseries[name])
 	}
-	return resp
+	return resp, nil
 }
 
 type crateAdapter struct {
@@ -220,7 +206,7 @@ func (ca *crateAdapter) runQuery(q *remote.Query) ([]*remote.TimeSeries, error) 
 		return nil, err
 	}
 
-	request := crateRequest{Stmt: query}
+	request := crateReadRequest{Stmt: query}
 
 	timer := prometheus.NewTimer(readCrateDuration)
 	result, err := ca.ep(context.Background(), request)
@@ -229,8 +215,7 @@ func (ca *crateAdapter) runQuery(q *remote.Query) ([]*remote.TimeSeries, error) 
 		readCrateErrors.Inc()
 		return nil, err
 	}
-	timeseries := responseToTimeseries(result.(*crateResponse))
-	return timeseries, nil
+	return responseToTimeseries(result.(*crateReadResponse))
 }
 
 func (ca *crateAdapter) handleRead(w http.ResponseWriter, r *http.Request) {
@@ -290,8 +275,8 @@ func (ca *crateAdapter) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func writesToCrateRequest(req *remote.WriteRequest) *crateRequest {
-	request := &crateRequest{
+func writesToCrateRequest(req *remote.WriteRequest) crateWriteRequest {
+	request := crateWriteRequest{
 		BulkArgs: make([][]interface{}, 0, len(req.Timeseries)),
 	}
 	request.Stmt = fmt.Sprintf(`INSERT INTO metrics ("labels", "labels_hash", "value", "valueRaw", "timestamp") VALUES (?, ?, ?, ?, ?)`)
@@ -304,7 +289,12 @@ func writesToCrateRequest(req *remote.WriteRequest) *crateRequest {
 
 		for _, s := range ts.Samples {
 			args := make([]interface{}, 0, 5)
-			args = append(args, metric)
+			metricJSON, err := json.Marshal(metric)
+			if err != nil {
+				// If this happens, it's a bug.
+				panic("error marshaling JSON")
+			}
+			args = append(args, string(metricJSON))
 			args = append(args, metric.Fingerprint().String())
 			// Convert to string to handle NaN/Inf/-Inf.
 			switch {
@@ -318,7 +308,7 @@ func writesToCrateRequest(req *remote.WriteRequest) *crateRequest {
 			// Crate.io can't handle full NaN values as required by Prometheus 2.0,
 			// so store the raw bits as an int64.
 			args = append(args, int64(math.Float64bits(s.Value)))
-			args = append(args, s.TimestampMs)
+			args = append(args, time.Unix(s.TimestampMs/1000, (s.TimestampMs%1000)*1e6))
 
 			request.BulkArgs = append(request.BulkArgs, args)
 		}
@@ -365,27 +355,6 @@ func (ca *crateAdapter) handleWrite(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func encodeCrateRequest(_ context.Context, r *http.Request, request interface{}) error {
-	jsonRequest, err := json.Marshal(request)
-	if err != nil {
-		return err
-	}
-	log.With("json", string(jsonRequest)).Debug("Request to Crate")
-	r.Body = ioutil.NopCloser(bytes.NewBuffer(jsonRequest))
-	r.Header.Set("Content-Type", "application/json; charset=utf-8")
-	return nil
-}
-
-func decodeCrateResponse(_ context.Context, r *http.Response) (interface{}, error) {
-	var response crateResponse
-	decoder := json.NewDecoder(r.Body)
-	decoder.UseNumber()
-	if err := decoder.Decode(&response); err != nil {
-		return nil, err
-	}
-	return &response, nil
-}
-
 func main() {
 	flag.Parse()
 
@@ -399,11 +368,12 @@ func main() {
 		if err != nil {
 			log.Fatal("Invalid URL %q: %s", url, err)
 		}
-		ep := httptransport.NewClient(
-			"POST",
-			url,
-			encodeCrateRequest,
-			decodeCrateResponse).Endpoint()
+		db, err := sql.Open("postgres", u)
+		if err != nil {
+			log.Fatalln("Error opening connection to CrateDB:", err)
+		}
+		c := dbClient{db: db}
+		ep := c.endpoint()
 		subscriber = append(subscriber, ep)
 	}
 	balancer := lb.NewRoundRobin(subscriber)
