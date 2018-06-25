@@ -389,12 +389,12 @@
 			"revisionTime": "2017-06-07T09:40:29Z"
 		},
 		{
-			"checksumSHA1": "KgT+peLCcuh0/m2mpoOZXuxXmwc=",
+			"checksumSHA1": "HmUAWd1Jm25cGH4Pyf3Zgp2RhkI=",
 			"origin": "github.com/prometheus/prometheus/vendor/gopkg.in/yaml.v2",
 			"path": "gopkg.in/yaml.v2",
-			"revision": "bfa37c8ee39d11078662dce16c162a61dccf616c",
-			"revisionTime": "2017-06-07T09:40:29Z"
+			"revision": "2bd510a63e48ac6bf4971d62199bdb1045c93f1a",
+			"revisionTime": "2018-06-22T14:21:04Z"
 		}
 	],
-	"rootPath": "github.com/brian-brazil/crate_adapter"
+	"rootPath": "github.com/crate/crate_adapter"
 }

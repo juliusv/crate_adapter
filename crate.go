@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
-	"time"
+
+	"github.com/jackc/pgx"
+	"github.com/jackc/pgx/pgtype"
 
 	"github.com/go-kit/kit/endpoint"
-	"github.com/lib/pq"
 )
 
 type crateWriteRequest struct {
@@ -20,7 +20,7 @@ type crateReadRequest struct {
 }
 
 type crateReadRow struct {
-	timestamp  time.Time
+	timestamp  pgtype.Timestamptz
 	labelsHash string
 	labels     []byte
 	value      float64
@@ -28,23 +28,20 @@ type crateReadRow struct {
 }
 
 type crateReadResponse struct {
-	Cols []string
 	Rows []*crateReadRow
 }
 
 // TODO: only open connections lazily. (TODO: check if that's already happening)
 type dbClient struct {
-	db *sql.DB
+	conn *pgx.Conn
 }
 
 func (c dbClient) endpoint() endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
 		switch r := request.(type) {
 		case crateWriteRequest:
-			fmt.Println("WRITE REQUEST")
 			return nil, c.write(r)
 		case crateReadRequest:
-			fmt.Println("READ REQUEST")
 			return c.read(r)
 		default:
 			panic("unknown request type")
@@ -53,64 +50,47 @@ func (c dbClient) endpoint() endpoint.Endpoint {
 }
 
 func (c dbClient) write(r crateWriteRequest) error {
-	// for _, a := range r.BulkArgs {
-	// 	_, err := c.db.Exec(r.Stmt, a...)
-	// 	if err != nil {
-	// 		return fmt.Errorf("error executing write statement: %v", err)
-	// 	}
-	// }
-	// return nil
-
-	// See https://godoc.org/github.com/lib/pq#hdr-Bulk_imports for efficient bulk imports.
-	txn, err := c.db.Begin()
+	_, err := c.conn.Prepare("write_staement", `INSERT INTO metrics ("labels", "labels_hash", "timestamp", "value", "valueRaw") VALUES ($1, $2, $3, $4, $5)`)
 	if err != nil {
-		return fmt.Errorf("error openening write transaction: %v", err)
+		return fmt.Errorf("error preparing statement: %v", err)
 	}
 
-	stmt, err := txn.Prepare(pq.CopyIn("metrics", "labels", "labels_hash", "value", "valueRaw", "timestamp"))
-	if err != nil {
-		return fmt.Errorf("error preparing write statement: %v", err)
-	}
-
+	batch := c.conn.BeginBatch()
 	for _, a := range r.BulkArgs {
-		_, err = stmt.Exec(a...)
-		if err != nil {
-			return fmt.Errorf("error executing write query: %v", err)
-		}
+		args := append(make([]interface{}, 0, len(a)), a...)
+		batch.Queue(
+			"write_statement",
+			args,
+			[]pgtype.OID{
+				pgtype.JSONOID,
+				pgtype.TextOID,
+				pgtype.TimestamptzOID,
+				pgtype.Float8OID,
+				pgtype.Int8OID,
+			},
+			nil,
+		)
 	}
 
-	// Flush buffered data.
-	_, err = stmt.Exec()
+	err = batch.Send(context.Background(), nil)
 	if err != nil {
-		return fmt.Errorf("error flushing write query: %v", err)
+		return fmt.Errorf("error executing write batch: %v", err)
 	}
 
-	err = stmt.Close()
+	err = batch.Close()
 	if err != nil {
-		return fmt.Errorf("error closing write query: %v", err)
-	}
-
-	err = txn.Commit()
-	if err != nil {
-		return fmt.Errorf("error committing write query: %v", err)
+		return fmt.Errorf("error closing write batch: %v", err)
 	}
 	return nil
 }
 
 func (c dbClient) read(r crateReadRequest) (*crateReadResponse, error) {
-	rows, err := c.db.Query(r.Stmt)
+	rows, err := c.conn.Query(r.Stmt)
 	if err != nil {
 		return nil, fmt.Errorf("error executing read query: %v", err)
 	}
 
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("error getting read request columns: %v", err)
-	}
-
-	resp := &crateReadResponse{
-		Cols: cols,
-	}
+	resp := &crateReadResponse{}
 
 	for rows.Next() {
 		rr := &crateReadRow{}

@@ -2,14 +2,12 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"math"
 	"net/http"
-	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -20,17 +18,19 @@ import (
 	"github.com/go-kit/kit/sd/lb"
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/snappy"
+	"github.com/jackc/pgx"
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/storage/remote"
+	yaml "gopkg.in/yaml.v2"
 )
 
 var (
 	listenAddress = flag.String("web.listen-address", ":9268", "Address to listen on for Prometheus requests.")
-	crateURL      = flag.String("crate.url", "postgres://crate@localhost:5432/?sslmode=disable", "URL to send Crate SQL to. Can list multiple URLs comma seperated.")
+	configFile    = flag.String("config.file", "config.yml", "Path to the configuration file.")
 
 	writeDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "crate_adapter_write_latency_seconds",
@@ -164,7 +164,7 @@ func responseToTimeseries(data *crateReadResponse) ([]*remote.TimeSeries, error)
 			metric[model.LabelName(k)] = model.LabelValue(v)
 		}
 
-		t := row.timestamp.UnixNano() / 1e6
+		t := row.timestamp.Time.UnixNano() / 1e6
 		v := math.Float64frombits(uint64(row.valueRaw))
 
 		ts, ok := timeseries[metric.String()]
@@ -296,6 +296,8 @@ func writesToCrateRequest(req *remote.WriteRequest) crateWriteRequest {
 			}
 			args = append(args, string(metricJSON))
 			args = append(args, metric.Fingerprint().String())
+			args = append(args, time.Unix(s.TimestampMs/1000, (s.TimestampMs%1000)*1e6).UTC())
+
 			// Convert to string to handle NaN/Inf/-Inf.
 			switch {
 			case math.IsInf(s.Value, 1):
@@ -308,7 +310,6 @@ func writesToCrateRequest(req *remote.WriteRequest) crateWriteRequest {
 			// Crate.io can't handle full NaN values as required by Prometheus 2.0,
 			// so store the raw bits as an int64.
 			args = append(args, int64(math.Float64bits(s.Value)))
-			args = append(args, time.Unix(s.TimestampMs/1000, (s.TimestampMs%1000)*1e6))
 
 			request.BulkArgs = append(request.BulkArgs, args)
 		}
@@ -355,30 +356,61 @@ func (ca *crateAdapter) handleWrite(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type crateEndpoint struct {
+	Host             string `yaml:"host"`
+	Port             uint16 `yaml:"port"`
+	User             string `yaml:"user"`
+	Password         string `yaml:"password"`
+	Database         string `yaml:"database"`
+	Table            string `yaml:"table"`
+	AllowInsecureTLS bool   `yaml:"allow_insecure_tls"`
+}
+
+type config struct {
+	Endpoints []crateEndpoint `yaml:"crate_endpoints"`
+}
+
+func loadConfig(filename string) (*config, error) {
+	content, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	conf := &config{}
+	yaml.UnmarshalStrict(content, conf)
+
+	if len(conf.Endpoints) == 0 {
+		return nil, fmt.Errorf("no CrateDB endpoints provided in configuration file")
+	}
+	return conf, nil
+}
+
 func main() {
 	flag.Parse()
 
-	urls := strings.Split(*crateURL, ",")
-	if len(urls) == 0 {
-		log.Fatal("No URLs provided in -crate.url.")
+	conf, err := loadConfig(*configFile)
+	if err != nil {
+		log.Fatalf("Error loading configuration file %q: %v", *configFile, err)
 	}
+
 	subscriber := sd.FixedEndpointer{}
-	for _, u := range urls {
-		url, err := url.Parse(u)
-		if err != nil {
-			log.Fatal("Invalid URL %q: %s", url, err)
-		}
-		db, err := sql.Open("postgres", u)
+	for _, ep := range conf.Endpoints {
+		conn, err := pgx.Connect(pgx.ConnConfig{
+			Host:     ep.Host,
+			Port:     ep.Port,
+			User:     ep.User,
+			Password: ep.Password,
+			Database: ep.Database,
+			//TLSConfig: &tls.Config{InsecureSkipVerify: ep.AllowInsecureTLS},
+		})
 		if err != nil {
 			log.Fatalln("Error opening connection to CrateDB:", err)
 		}
-		c := dbClient{db: db}
-		ep := c.endpoint()
-		subscriber = append(subscriber, ep)
+		c := dbClient{conn: conn}
+		subscriber = append(subscriber, c.endpoint())
 	}
 	balancer := lb.NewRoundRobin(subscriber)
 	// Try each URL once.
-	retry := lb.Retry(len(urls), 1*time.Minute, balancer)
+	retry := lb.Retry(len(conf.Endpoints), 1*time.Minute, balancer)
 
 	ca := crateAdapter{
 		ep: retry,
