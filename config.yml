@@ -1,0 +1,15 @@
+crate_endpoints:
+  - host: "localhost"
+    port: 5432
+    user: "crate"
+    password: "foo"
+    #database: "docs"
+    table: "metrics"
+    allow_insecure_tls: true
+  - host: "localhost"
+    port: 5432
+    user: "crate"
+    password: "foo"
+    #database: "docs"
+    table: "metrics"
+    allow_insecure_tls: false

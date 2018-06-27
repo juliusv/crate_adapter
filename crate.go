@@ -20,9 +20,9 @@ type crateReadRequest struct {
 }
 
 type crateReadRow struct {
-	timestamp  pgtype.Timestamptz
 	labelsHash string
-	labels     []byte
+	labels     map[string]string
+	timestamp  pgtype.Timestamptz
 	value      float64
 	valueRaw   int64
 }
@@ -50,7 +50,7 @@ func (c dbClient) endpoint() endpoint.Endpoint {
 }
 
 func (c dbClient) write(r crateWriteRequest) error {
-	_, err := c.conn.Prepare("write_staement", `INSERT INTO metrics ("labels", "labels_hash", "timestamp", "value", "valueRaw") VALUES ($1, $2, $3, $4, $5)`)
+	_, err := c.conn.Prepare("write_statement", `INSERT INTO metrics ("labels", "labels_hash", "timestamp", "value", "valueRaw") VALUES ($1, $2, $3, $4, $5)`)
 	if err != nil {
 		return fmt.Errorf("error preparing statement: %v", err)
 	}
@@ -63,7 +63,7 @@ func (c dbClient) write(r crateWriteRequest) error {
 			args,
 			[]pgtype.OID{
 				pgtype.JSONOID,
-				pgtype.TextOID,
+				pgtype.VarcharOID,
 				pgtype.TimestamptzOID,
 				pgtype.Float8OID,
 				pgtype.Int8OID,
@@ -89,6 +89,7 @@ func (c dbClient) read(r crateReadRequest) (*crateReadResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error executing read query: %v", err)
 	}
+	defer rows.Close()
 
 	resp := &crateReadResponse{}
 

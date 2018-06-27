@@ -147,19 +147,19 @@ func queryToSQL(q *remote.Query) (string, error) {
 	selectors = append(selectors, fmt.Sprintf("(timestamp <= %d)", q.EndTimestampMs))
 	selectors = append(selectors, fmt.Sprintf("(timestamp >= %d)", q.StartTimestampMs))
 
-	return fmt.Sprintf("SELECT * from metrics WHERE %s ORDER BY timestamp", strings.Join(selectors, " AND ")), nil
+	return fmt.Sprintf(`SELECT labels, labels_hash, timestamp, value, "valueRaw" FROM metrics WHERE %s ORDER BY timestamp`, strings.Join(selectors, " AND ")), nil
 }
 
 func responseToTimeseries(data *crateReadResponse) ([]*remote.TimeSeries, error) {
 	timeseries := map[string]*remote.TimeSeries{}
 	for _, row := range data.Rows {
-		labels := map[string]string{}
-		err := json.Unmarshal(row.labels, &labels)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal labels %q: %v", row.labels, err)
-		}
+		// labels := map[string]string{}
+		// err := json.Unmarshal(row.labels, &labels)
+		// if err != nil {
+		// 	return nil, fmt.Errorf("failed to unmarshal labels %q: %v", row.labels, err)
+		// }
 		metric := model.Metric{}
-		for k, v := range labels {
+		for k, v := range row.labels {
 			// lfoo -> foo.
 			metric[model.LabelName(k)] = model.LabelValue(v)
 		}
@@ -296,7 +296,8 @@ func writesToCrateRequest(req *remote.WriteRequest) crateWriteRequest {
 			}
 			args = append(args, string(metricJSON))
 			args = append(args, metric.Fingerprint().String())
-			args = append(args, time.Unix(s.TimestampMs/1000, (s.TimestampMs%1000)*1e6).UTC())
+			//"2018-06-25 18:23:34.100+00"
+			args = append(args, time.Unix(s.TimestampMs/1000, (s.TimestampMs%1000)*1e6).UTC().Format("2006-01-02 15:04:05.000-07"))
 
 			// Convert to string to handle NaN/Inf/-Inf.
 			switch {
